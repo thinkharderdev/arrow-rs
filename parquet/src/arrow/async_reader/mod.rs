@@ -77,8 +77,9 @@
 
 use std::collections::VecDeque;
 use std::fmt::Formatter;
+use std::io;
 use std::io::SeekFrom;
-use std::ops::Range;
+use std::ops::{Range, RangeBounds};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -120,13 +121,38 @@ use crate::arrow::schema::ParquetField;
 #[cfg(feature = "object_store")]
 pub use store::*;
 
+pub trait ByteBuffer: AsRef<[u8]> + Send + 'static {
+    type Read: io::Read;
+
+    fn slice(&self, range: impl RangeBounds<usize>) -> Self;
+
+    fn reader(&self) -> Self::Read;
+}
+
+impl ByteBuffer for Bytes {
+    type Read = bytes::buf::Reader<Bytes>;
+
+    fn slice(&self, range: impl RangeBounds<usize>) -> Self {
+        self.slice(range)
+    }
+
+    fn reader(&self) -> Self::Read {
+        self.clone().reader()
+    }
+}
+
 /// The asynchronous interface used by [`ParquetRecordBatchStream`] to read parquet files
 pub trait AsyncFileReader: Send {
+    type Buf: ByteBuffer;
+
     /// Retrieve the bytes in `range`
-    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>>;
+    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Self::Buf>>;
 
     /// Retrieve multiple byte ranges. The default implementation will call `get_bytes` sequentially
-    fn get_byte_ranges(&mut self, ranges: Vec<Range<usize>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<usize>>,
+    ) -> BoxFuture<'_, Result<Vec<Self::Buf>>> {
         async move {
             let mut result = Vec::with_capacity(ranges.len());
 
@@ -146,7 +172,9 @@ pub trait AsyncFileReader: Send {
     fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>>>;
 }
 
-impl AsyncFileReader for Box<dyn AsyncFileReader> {
+impl<B: AsRef<[u8]> + Send + 'static> AsyncFileReader for Box<dyn AsyncFileReader<Buf = B>> {
+    type Buf = B;
+
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
         self.as_mut().get_bytes(range)
     }
@@ -161,6 +189,8 @@ impl AsyncFileReader for Box<dyn AsyncFileReader> {
 }
 
 impl<T: AsyncRead + AsyncSeek + Unpin + Send> AsyncFileReader for T {
+    type Buf = Bytes;
+
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
         async move {
             self.seek(SeekFrom::Start(range.start as u64)).await?;
@@ -830,25 +860,25 @@ impl<'a> RowGroups for InMemoryRowGroup<'a> {
 
 /// An in-memory column chunk
 #[derive(Clone)]
-enum ColumnChunkData {
+enum ColumnChunkData<B> {
     /// Column chunk data representing only a subset of data pages
     Sparse {
         /// Length of the full column chunk
         length: usize,
         /// Set of data pages included in this sparse chunk. Each element is a tuple
         /// of (page offset, page data)
-        data: Vec<(usize, Bytes)>,
+        data: Vec<(usize, B)>,
     },
     /// Full column chunk and its offset
-    Dense { offset: usize, data: Bytes },
+    Dense { offset: usize, data: B },
 }
 
-impl ColumnChunkData {
-    fn get(&self, start: u64) -> Result<Bytes> {
+impl<B: ByteBuffer> ColumnChunkData<B> {
+    fn get(&self, start: u64) -> Result<B> {
         match &self {
             ColumnChunkData::Sparse { data, .. } => data
                 .binary_search_by_key(&start, |(offset, _)| *offset as u64)
-                .map(|idx| data[idx].1.clone())
+                .map(|idx| data[idx].1.as_ref())
                 .map_err(|_| {
                     ParquetError::General(format!(
                         "Invalid offset in sparse column chunk data: {start}"
@@ -856,29 +886,29 @@ impl ColumnChunkData {
                 }),
             ColumnChunkData::Dense { offset, data } => {
                 let start = start as usize - *offset;
-                Ok(data.slice(start..))
+                Ok(&data.as_ref()[start..])
             }
         }
     }
 }
 
-impl Length for ColumnChunkData {
+impl<B: ByteBuffer> Length for ColumnChunkData<B> {
     fn len(&self) -> u64 {
         match &self {
             ColumnChunkData::Sparse { length, .. } => *length as u64,
-            ColumnChunkData::Dense { data, .. } => data.len() as u64,
+            ColumnChunkData::Dense { data, .. } => data.as_ref().len() as u64,
         }
     }
 }
 
-impl ChunkReader for ColumnChunkData {
-    type T = bytes::buf::Reader<Bytes>;
+impl<B: ByteBuffer> ChunkReader for ColumnChunkData<B> {
+    type T = B::Read;
 
     fn get_read(&self, start: u64) -> Result<Self::T> {
         Ok(self.get(start)?.reader())
     }
 
-    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+    fn get_bytes(&self, start: u64, length: usize) -> Result<B> {
         Ok(self.get(start)?.slice(..length))
     }
 }
@@ -933,6 +963,7 @@ mod tests {
     }
 
     impl AsyncFileReader for TestReader {
+        type Buf = Bytes;
         fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
             self.requests.lock().unwrap().push(range.clone());
             futures::future::ready(Ok(self.data.slice(range))).boxed()
