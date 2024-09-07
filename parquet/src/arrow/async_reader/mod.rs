@@ -121,10 +121,14 @@ use crate::arrow::schema::ParquetField;
 #[cfg(feature = "object_store")]
 pub use store::*;
 
-pub trait ByteBuffer: AsRef<[u8]> + Send + 'static {
+pub trait ByteBuffer: Clone + AsRef<[u8]> + Send + Sync + 'static {
     type Read: io::Read;
 
     fn slice(&self, range: impl RangeBounds<usize>) -> Self;
+
+    fn to_bytes(self) -> Bytes {
+        Bytes::copy_from_slice(self.as_ref())
+    }
 
     fn reader(&self) -> Self::Read;
 }
@@ -134,6 +138,10 @@ impl ByteBuffer for Bytes {
 
     fn slice(&self, range: impl RangeBounds<usize>) -> Self {
         self.slice(range)
+    }
+
+    fn to_bytes(self) -> Bytes {
+        self
     }
 
     fn reader(&self) -> Self::Read {
@@ -172,14 +180,14 @@ pub trait AsyncFileReader: Send {
     fn get_metadata(&mut self) -> BoxFuture<'_, Result<Arc<ParquetMetaData>>>;
 }
 
-impl<B: AsRef<[u8]> + Send + 'static> AsyncFileReader for Box<dyn AsyncFileReader<Buf = B>> {
+impl<B: ByteBuffer> AsyncFileReader for Box<dyn AsyncFileReader<Buf = B>> {
     type Buf = B;
 
-    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
+    fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<B>> {
         self.as_mut().get_bytes(range)
     }
 
-    fn get_byte_ranges(&mut self, ranges: Vec<Range<usize>>) -> BoxFuture<'_, Result<Vec<Bytes>>> {
+    fn get_byte_ranges(&mut self, ranges: Vec<Range<usize>>) -> BoxFuture<'_, Result<Vec<B>>> {
         self.as_mut().get_byte_ranges(ranges)
     }
 
@@ -396,7 +404,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
         .await?;
 
         let (header, bitset_offset) =
-            chunk_read_bloom_filter_header_and_offset(offset as u64, buffer.clone())?;
+            chunk_read_bloom_filter_header_and_offset(offset as u64, buffer.as_ref())?;
 
         match header.algorithm {
             BloomFilterAlgorithm::BLOCK(_) => {
@@ -426,7 +434,7 @@ impl<T: AsyncFileReader + Send + 'static> ParquetRecordBatchStreamBuilder<T> {
                     .await?
             }
         };
-        Ok(Some(Sbbf::new(&bitset)))
+        Ok(Some(Sbbf::new(bitset.as_ref())))
     }
 
     /// Build a new [`ParquetRecordBatchStream`]
@@ -731,16 +739,16 @@ where
 }
 
 /// An in-memory collection of column chunks
-struct InMemoryRowGroup<'a> {
+struct InMemoryRowGroup<'a, B> {
     metadata: &'a RowGroupMetaData,
     page_locations: Option<&'a [Vec<PageLocation>]>,
-    column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
+    column_chunks: Vec<Option<Arc<ColumnChunkData<B>>>>,
     row_count: usize,
 }
 
-impl<'a> InMemoryRowGroup<'a> {
+impl<'a, B: ByteBuffer> InMemoryRowGroup<'a, B> {
     /// Fetches the necessary column data into memory
-    async fn fetch<T: AsyncFileReader + Send>(
+    async fn fetch<T: AsyncFileReader<Buf = B> + Send>(
         &mut self,
         input: &mut T,
         projection: &ProjectionMask,
@@ -831,7 +839,7 @@ impl<'a> InMemoryRowGroup<'a> {
     }
 }
 
-impl<'a> RowGroups for InMemoryRowGroup<'a> {
+impl<'a, B: ByteBuffer> RowGroups for InMemoryRowGroup<'a, B> {
     fn num_rows(&self) -> usize {
         self.row_count
     }
@@ -878,7 +886,7 @@ impl<B: ByteBuffer> ColumnChunkData<B> {
         match &self {
             ColumnChunkData::Sparse { data, .. } => data
                 .binary_search_by_key(&start, |(offset, _)| *offset as u64)
-                .map(|idx| data[idx].1.as_ref())
+                .map(|idx| data[idx].1.clone())
                 .map_err(|_| {
                     ParquetError::General(format!(
                         "Invalid offset in sparse column chunk data: {start}"
@@ -886,7 +894,7 @@ impl<B: ByteBuffer> ColumnChunkData<B> {
                 }),
             ColumnChunkData::Dense { offset, data } => {
                 let start = start as usize - *offset;
-                Ok(&data.as_ref()[start..])
+                Ok(data.slice(start..))
             }
         }
     }
@@ -908,8 +916,8 @@ impl<B: ByteBuffer> ChunkReader for ColumnChunkData<B> {
         Ok(self.get(start)?.reader())
     }
 
-    fn get_bytes(&self, start: u64, length: usize) -> Result<B> {
-        Ok(self.get(start)?.slice(..length))
+    fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes> {
+        Ok(self.get(start)?.slice(..length).to_bytes())
     }
 }
 

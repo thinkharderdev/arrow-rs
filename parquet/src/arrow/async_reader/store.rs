@@ -102,6 +102,8 @@ impl ParquetObjectReader {
 }
 
 impl AsyncFileReader for ParquetObjectReader {
+    type Buf = Bytes;
+
     fn get_bytes(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
         self.store
             .get_range(&self.meta.location, range)

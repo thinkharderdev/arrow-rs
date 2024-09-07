@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::arrow::async_reader::AsyncFileReader;
+use crate::arrow::async_reader::{AsyncFileReader, ByteBuffer};
 use crate::errors::{ParquetError, Result};
 use crate::file::footer::{decode_footer, decode_metadata};
 use crate::file::metadata::ParquetMetaData;
@@ -29,23 +29,26 @@ use std::ops::Range;
 
 /// A data source that can be used with [`MetadataLoader`] to load [`ParquetMetaData`]
 pub trait MetadataFetch {
-    fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>>;
+    type Buf: ByteBuffer;
+    fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Self::Buf>>;
 }
 
 impl<'a, T: AsyncFileReader> MetadataFetch for &'a mut T {
-    fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
+    type Buf = T::Buf;
+
+    fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<T::Buf>> {
         self.get_bytes(range)
     }
 }
 
 /// An asynchronous interface to load [`ParquetMetaData`] from an async source
-pub struct MetadataLoader<F> {
+pub struct MetadataLoader<F: MetadataFetch> {
     /// Function that fetches byte ranges asynchronously
     fetch: F,
     /// The in-progress metadata
     metadata: ParquetMetaData,
     /// The offset and bytes of remaining unparsed data
-    remainder: Option<(usize, Bytes)>,
+    remainder: Option<(usize, F::Buf)>,
 }
 
 impl<F: MetadataFetch> MetadataLoader<F> {
@@ -68,10 +71,10 @@ impl<F: MetadataFetch> MetadataLoader<F> {
         };
 
         let suffix = fetch.fetch(footer_start..file_size).await?;
-        let suffix_len = suffix.len();
+        let suffix_len = suffix.as_ref().len();
 
         let mut footer = [0; 8];
-        footer.copy_from_slice(&suffix[suffix_len - 8..suffix_len]);
+        footer.copy_from_slice(&suffix.as_ref()[suffix_len - 8..suffix_len]);
 
         let length = decode_footer(&footer)?;
 
@@ -87,11 +90,11 @@ impl<F: MetadataFetch> MetadataLoader<F> {
         let (metadata, remainder) = if length > suffix_len - 8 {
             let metadata_start = file_size - length - 8;
             let meta = fetch.fetch(metadata_start..file_size - 8).await?;
-            (decode_metadata(&meta)?, None)
+            (decode_metadata(meta.as_ref())?, None)
         } else {
             let metadata_start = file_size - length - 8 - footer_start;
 
-            let slice = &suffix[metadata_start..suffix_len - 8];
+            let slice = &suffix.as_ref()[metadata_start..suffix_len - 8];
             (
                 decode_metadata(slice)?,
                 Some((footer_start, suffix.slice(..metadata_start))),
@@ -143,7 +146,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
         };
 
         // Sanity check
-        assert_eq!(data.len(), range.end - range.start);
+        assert_eq!(data.as_ref().len(), range.end - range.start);
         let offset = range.start;
 
         if column_index {
@@ -156,7 +159,7 @@ impl<F: MetadataFetch> MetadataLoader<F> {
                         .iter()
                         .map(|c| match c.column_index_range() {
                             Some(r) => decode_column_index(
-                                &data[r.start - offset..r.end - offset],
+                                &data.as_ref()[r.start - offset..r.end - offset],
                                 c.column_type(),
                             ),
                             None => Ok(Index::NONE),
@@ -177,7 +180,9 @@ impl<F: MetadataFetch> MetadataLoader<F> {
                     x.columns()
                         .iter()
                         .map(|c| match c.offset_index_range() {
-                            Some(r) => decode_offset_index(&data[r.start - offset..r.end - offset]),
+                            Some(r) => decode_offset_index(
+                                &data.as_ref()[r.start - offset..r.end - offset],
+                            ),
                             None => Err(general_err!("missing offset index")),
                         })
                         .collect::<Result<Vec<_>>>()
@@ -203,6 +208,8 @@ where
     F: FnMut(Range<usize>) -> Fut + Send,
     Fut: Future<Output = Result<Bytes>> + Send,
 {
+    type Buf = Bytes;
+
     fn fetch(&mut self, range: Range<usize>) -> BoxFuture<'_, Result<Bytes>> {
         async move { self.0(range).await }.boxed()
     }

@@ -192,7 +192,7 @@ pub(crate) const SBBF_HEADER_SIZE_ESTIMATE: usize = 20;
 /// both the header and the offset after it (for bitset).
 pub(crate) fn chunk_read_bloom_filter_header_and_offset(
     offset: u64,
-    buffer: Bytes,
+    buffer: &[u8],
 ) -> Result<(BloomFilterHeader, u64), ParquetError> {
     let (header, length) = read_bloom_filter_header_and_length(buffer)?;
     Ok((header, offset + length))
@@ -202,10 +202,10 @@ pub(crate) fn chunk_read_bloom_filter_header_and_offset(
 /// length of the header.
 #[inline]
 pub(crate) fn read_bloom_filter_header_and_length(
-    buffer: Bytes,
+    buffer: &[u8],
 ) -> Result<(BloomFilterHeader, u64), ParquetError> {
     let total_length = buffer.len();
-    let mut prot = TCompactSliceInputProtocol::new(buffer.as_ref());
+    let mut prot = TCompactSliceInputProtocol::new(buffer);
     let header = BloomFilterHeader::read_from_in_protocol(&mut prot)
         .map_err(|e| ParquetError::General(format!("Could not read bloom filter header: {e}")))?;
     Ok((header, (total_length - prot.as_slice().len()) as u64))
@@ -322,7 +322,7 @@ impl Sbbf {
         }?;
 
         let (header, bitset_offset) =
-            chunk_read_bloom_filter_header_and_offset(offset, buffer.clone())?;
+            chunk_read_bloom_filter_header_and_offset(offset, buffer.as_ref())?;
 
         match header.algorithm {
             BloomFilterAlgorithm::BLOCK(_) => {
@@ -463,7 +463,7 @@ mod tests {
                 num_bytes,
             },
             read_length,
-        ) = read_bloom_filter_header_and_length(Bytes::copy_from_slice(buffer)).unwrap();
+        ) = read_bloom_filter_header_and_length(buffer).unwrap();
         assert_eq!(read_length, 15);
         assert_eq!(
             algorithm,
